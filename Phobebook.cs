@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 
 namespace pb
@@ -56,12 +57,14 @@ namespace pb
                     return;
 
                 _stream.Position = _stream.Length - sizeof(int);
-                var numOfRecords = _br.ReadInt32();
-                _endOfData = (int)_stream.Length - ((numOfRecords + 1) * sizeof(int));
-                _stream.Position = _endOfData;
+                _endOfData = _br.ReadInt32();
+                _stream.Position = _endOfData; 
+                using var gzip = new GZipStream(_stream, CompressionMode.Decompress, leaveOpen: true);
+                using var gzipBR = new BinaryReader(gzip);
+                var numOfRecords = gzipBR.ReadInt32();
                 for (int i = 0; i < numOfRecords; i++)
                 {
-                    _sortedPositions.Add(_br.ReadInt32());
+                    _sortedPositions.Add(gzipBR .ReadInt32());
                 }
             }
 
@@ -114,11 +117,18 @@ namespace pb
             public void Flush()
             {
                 _stream.Position = _endOfData;
-                foreach (var p in _sortedPositions)
+                using var gzip = new GZipStream(_stream, CompressionLevel.Optimal, leaveOpen: true);
                 {
-                    _bw.Write(p);
+                    using var gzipBW = new BinaryWriter(gzip);
+                    {
+                        gzipBW.Write(_sortedPositions.Count);
+                        foreach (var p in _sortedPositions)
+                        {
+                            gzipBW.Write(p);
+                        }
+                    }
                 }
-                _bw.Write(_sortedPositions.Count);
+                _bw.Write(_endOfData);
             }
 
             public Entry GetEntry(int pos)
