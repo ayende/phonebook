@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace pb
@@ -9,6 +10,7 @@ namespace pb
     {
         public class Entry
         {
+            public const int EstimatedRecordLen = 64;
             public string Name;
 
             public string Number;
@@ -46,276 +48,331 @@ namespace pb
             }
         }
 
-        public class Node
+        private readonly string _directory;
+
+        public Phonebook(string directory)
         {
-            public long Self = -1, Left = -1, Right = -1;
-            public int Height;
-            public sbyte BranchFactor;
-
-            public const int SizeOfNodeHeader = (sizeof(long) * 2) + sizeof(int) + sizeof(sbyte);
-
-            public Entry Entry;
-            public string Key;
-
-            public static Node Read(BinaryReader br, long pos, bool readEntry)
-            {
-                if (pos == -1) return null;
-                br.BaseStream.Position = pos;
-                var node = new Node
-                {
-                    Self = pos,
-                };
-
-                node.Left = br.ReadInt64();
-                node.Right = br.ReadInt64();
-                node.Height = br.ReadInt32();
-                node.BranchFactor = br.ReadSByte();
-                if (readEntry)
-                    node.Entry = Entry.Read(br);
-                // we need to read the key always
-                node.Key = node.Entry == null ? br.ReadString() : node.Entry.Name;
-                return node;
-            }
-
-            public long Write(BinaryWriter bw)
-            {
-                bw.BaseStream.Position = Entry != null ? bw.BaseStream.Length : Self;
-                Self = bw.BaseStream.Position;
-                bw.Write(Left);
-                bw.Write(Right);
-                bw.Write(Height);
-                bw.Write(BranchFactor);
-                if (Entry != null)
-                {
-                    Entry.Write(bw);
-                }
-                return Self;
-            }
-
-            private static int ReadHeight(BinaryReader br, long entryPos)
-            {
-                if (entryPos == -1)
-                    return 0;
-                br.BaseStream.Position = entryPos + sizeof(long) + sizeof(long);
-                return br.ReadInt32();
-            }
-
-
-            public void UpdateHeight(BinaryReader br)
-            {
-                var leftHeight = Node.ReadHeight(br, Left);
-                var rightHeight = Node.ReadHeight(br, Right);
-                Height = Math.Max(leftHeight, rightHeight) + 1;
-                BranchFactor = (sbyte)(leftHeight - rightHeight);
-            }
-
-            public Entry Find(BinaryReader br, string name)
-            {
-                var comp = string.Compare(name, Key);
-                if(comp == 0)
-                {
-                    br.BaseStream.Position = Self + SizeOfNodeHeader;
-                    return Entry.Read(br);
-                }
-                var child= Read(br, comp < 0 ? Left : Right, readEntry: false);
-                return child?.Find(br, name);
-            }
-
-            public IEnumerable<Entry> IterateAfter(BinaryReader br,string afterName)
-            {
-                var left = Read(br, Left, readEntry: true);
-                if (left != null && string.Compare(afterName, left.Key) <= 0)
-                {
-                    foreach (var item in left.IterateAfter(br, afterName))
-                    {
-                        yield return item;
-                    }
-                }
-                if (string.Compare(afterName, Key) <= 0)
-                    yield return Entry;
-                var right = Read(br, Right, readEntry: true);
-                if (right != null)
-                {
-                    foreach (var item in right.IterateAfter(br, afterName))
-                    {
-                        yield return item;
-                    }
-                }
-            }
-        }
-
-        private readonly string _filename;
-
-        public Phonebook(string filename)
-        {
-            _filename = filename;
+            _directory = directory;
         }
 
 
         public void InsertOrUpdate(Entry entry)
         {
-            using var file = File.Open(_filename, FileMode.OpenOrCreate);
-            using var bw = new BinaryWriter(file, Encoding.UTF8, leaveOpen: true);
+            long entryPos;
+            using (var file = File.Open(Path.Combine(_directory, "records"), FileMode.OpenOrCreate))
+            using (var bw = new BinaryWriter(file, Encoding.UTF8, leaveOpen: true))
+            {
+                entryPos = file.Position = file.Length;
+                entry.Write(bw);
+            }
+
+            using (var sorted = File.Open(Path.Combine(_directory, "sorted.last"), FileMode.OpenOrCreate))
+            using (var bw = new BinaryWriter(sorted, Encoding.UTF8, leaveOpen: true))
+            {
+                sorted.Position = sorted.Length;
+                bw.Write(entryPos);
+
+                if (sorted.Length < 1024)
+                    return;
+            }
+
+            Merge();
+        }
+
+        private interface IRandomAccess : IDisposable
+        {
+            long Current => this[CurrentIndex];
+
+            int CurrentIndex { get; set; }
+            int Count { get; }
+            long this[int index] { get; }
+        }
+
+        private class ListRandomAccess : IRandomAccess
+        {
+            private readonly List<long> _items;
+
+            public ListRandomAccess(List<long> items)
+            {
+                this._items = items;
+            }
+            public int CurrentIndex { get; set; }
+            public long this[int index] => _items[index];
+
+            public int Count => _items.Count;
+
+            public void Dispose()
+            {
+            }
+        }
+        private class SlicedRandomAccess : IRandomAccess
+        {
+            private readonly IRandomAccess _inner;
+            private readonly int _start;
+
+            public SlicedRandomAccess(IRandomAccess inner, int start)
+            {
+                _inner = inner;
+                _start = start;
+            }
+
+            public long this[int index] => _inner[index + _start];
+
+            public int Count => _inner.Count - _start;
+
+            public int CurrentIndex { get; set; }
+
+            public void Dispose()
+            {
+                _inner.Dispose();
+            }
+        }
+
+        private class FileRandomAccess : IRandomAccess
+        {
+            BinaryReader _br;
+
+            public FileRandomAccess(BinaryReader br)
+            {
+                _br = br;
+            }
+            public int CurrentIndex { get; set; }
+            public long this[int index]
+            {
+                get
+                {
+                    _br.BaseStream.Position = index * sizeof(long);
+                    return _br.ReadInt64();
+                }
+            }
+
+            public int Count => (int)(_br.BaseStream.Length / sizeof(long));
+
+            public void Dispose()
+            {
+                _br.Dispose();
+            }
+        }
+
+        private IRandomAccess ReadLastSorted()
+        {
+            using (var file = File.Open(Path.Combine(_directory, "records"), FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read))
+            using (var recordsReader = new BinaryReader(file))
+            using (var sorted = File.Open(Path.Combine(_directory, "sorted.last"), FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read))
+            using (var br = new BinaryReader(sorted))
+            {
+                var dic = new SortedDictionary<string, long>();
+                while (sorted.Position < sorted.Length)
+                {
+                    var pos = br.ReadInt64();
+                    recordsReader.BaseStream.Position = pos;
+                    dic[recordsReader.ReadString()] = pos;
+                }
+                return new ListRandomAccess(dic.Values.ToList());
+            }
+        }
+
+        private IRandomAccess ReadSorted(string filename)
+        {
+            var sorted = File.Open(filename, FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read);
+            var br = new BinaryReader(sorted);
+            return new FileRandomAccess(br);
+
+        }
+
+        private long MergeSortedPositions(List<IRandomAccess> toMerge)
+        {
+            using var file = File.Open(Path.Combine(_directory, "records"), FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read);
             using var br = new BinaryReader(file, Encoding.UTF8, leaveOpen: true);
-            if (file.Length == 0)
+
+            long deletes = 0;
+            using var sorted = File.Open(Path.Combine(_directory, $"sorted.{DateTime.UtcNow:yyyy-MM-ddThh-mm-ss}-{Guid.NewGuid()}"), FileMode.OpenOrCreate);
+            using var bw = new BinaryWriter(sorted, Encoding.UTF8, leaveOpen: true);
+            foreach (var pos in MergeSorted(toMerge, br))
             {
-                long rootPos = WriteNewNode(entry, bw);
-                bw.Write(rootPos); // end of file marker
-                return;
+                if (pos < 0)
+                {
+                    deletes++;
+                    continue;
+                }
+                bw.Write(pos);
             }
-            file.Position = file.Length - sizeof(long);
-            var root = Node.Read(br, br.ReadInt64(), readEntry: false);
-            var newRootPos = InsertOrUpdate(br, bw, root, entry);
-            file.Position = file.Length;
-            bw.Write(newRootPos);
+            return deletes;
         }
 
-        private static long WriteNewNode(Entry entry, BinaryWriter bw)
+        private static IEnumerable<long> MergeSorted(List<IRandomAccess> toMerge, BinaryReader br)
         {
-            bw.BaseStream.Position = Math.Max(0, bw.BaseStream.Length - sizeof(long));
-            var newRoot = new Node
+            var heap = new SortedList<string, IRandomAccess>();
+            foreach (var it in toMerge)
             {
-                Self = bw.BaseStream.Position,
-                Height = 1,
-                Left = -1,
-                Right = -1,
-                Entry = entry
+                it.CurrentIndex = -1;
+                TryAddToHeap(it);
+            }
+
+            while (heap.Count > 0)
+            {
+                var it = heap.Values[0];
+                heap.RemoveAt(0);
+                yield return it.Current;
+                TryAddToHeap(it);
+            }
+
+            void TryAddToHeap(IRandomAccess it)
+            {
+                it.CurrentIndex++;
+                if (it.CurrentIndex >= it.Count)
+                {
+                    it.Dispose();
+                    return;
+                }
+                var cur = it.Current;
+                if (cur < 0)
+                    cur = ~cur;
+                br.BaseStream.Position = cur;
+                heap.Add(br.ReadString(), it);
+            }
+        }
+
+        private void Compact()
+        {
+            using var file = File.Open(Path.Combine(_directory, "records"), FileMode.OpenOrCreate);
+            using var newFile = File.Open(Path.Combine(_directory, "records.new"), FileMode.OpenOrCreate);
+            using var bw = new BinaryWriter(newFile, Encoding.UTF8, leaveOpen: true);
+            using var br = new BinaryReader(file, Encoding.UTF8, leaveOpen: true);
+
+            var positionsToMerge = GetSortedPositions();
+            foreach (var pos in MergeSorted(positionsToMerge, br))
+            {
+                if (pos < 0)
+                {
+                    continue;
+                }
+                br.BaseStream.Position = pos;
+                var entry = Entry.Read(br);
+                entry.Write(bw);
+            }
+        }
+
+        private List<IRandomAccess> GetSortedPositions()
+        {
+            var toMerge = new List<IRandomAccess>
+            {
+                ReadLastSorted()
             };
-            newRoot.Write(bw);
-            return newRoot.Self;
+
+            toMerge.AddRange(
+                Directory.GetFiles(_directory, "sorted.*")
+                .Where(f => Path.GetExtension(f) != ".last")
+                .Select(f => ReadSorted(f))
+            );
+            return toMerge;
         }
 
-        private long InsertOrUpdate(BinaryReader br, BinaryWriter bw, Node root, Entry entry)
+        public void Merge()
         {
-            var comp = string.Compare(entry.Name, root.Key);
-            if (comp == 0)// update, write new node (may have different size)
+            var toMerge = new List<IRandomAccess>
             {
-                bw.BaseStream.Position = bw.BaseStream.Length - sizeof(long);
-                var newNode = new Node
-                {
-                    Self = bw.BaseStream.Position,
-                    Left = root.Left,
-                    Right = root.Right,
-                    Height = root.Height,
-                    Entry = entry
-                };
-                newNode.Write(bw);
-                // no change to the node structure, no need to rebalance
-                return newNode.Self;
+                ReadLastSorted()
+            };
+
+            var files = Directory.GetFiles(_directory, "sorted.*")
+                .Where(f => Path.GetExtension(f) != ".last")
+                .GroupBy(f => (int)Math.Log2(new FileInfo(f).Length)) // same size in power by 2, basically
+                .OrderBy(g => g.Key)
+                .FirstOrDefault()?.ToList() ?? Enumerable.Empty<string>();
+
+            foreach (var file in files)
+            {
+                toMerge.Add(ReadSorted(file));
             }
 
-            if (comp < 0)
+            long deletes = MergeSortedPositions(toMerge);
+
+            foreach (var file in files)
             {
-                long left;
-                if (root.Left == -1)
-                {
-                    left = WriteNewNode(entry, bw);
-                }
+                File.Delete(file);
+            }
+            File.Delete(Path.Combine(_directory, "sorted.last"));
+            using var statsFile = File.Open(Path.Combine(_directory, "metadata.stats"), FileMode.OpenOrCreate);
+            using var bw = new BinaryWriter(statsFile, Encoding.UTF8, leaveOpen: true);
+            using var br = new BinaryReader(statsFile, Encoding.UTF8, leaveOpen: true);
+
+            if (statsFile.Length > 0)
+            {
+                deletes += br.ReadInt64();
+            }
+
+
+            var recordsLen = new FileInfo(Path.Combine(_directory, "records")).Length / Entry.EstimatedRecordLen;
+
+            if (deletes * 4 > recordsLen)
+            {
+                Compact();
+                deletes = 0;
+            }
+
+            statsFile.Position = 0;
+            bw.Write(deletes);
+        }
+        private int Search(IRandomAccess access, BinaryReader br, string name)
+        {
+            int low = 0;
+            int high = access.Count - 1;
+            int mid = 0;
+            while (low <= high)
+            {
+                mid = (low + high) >> 1;
+                var pos = access[mid];
+                if (pos < 0)
+                    pos = ~pos;
+                br.BaseStream.Position = pos;
+                var curName = br.ReadString();
+                var comp = string.Compare(name, curName);
+                if (comp == 0)
+                    return mid;
+                if (comp < 0)
+                    high = mid - 1;
                 else
-                {
-                    left = InsertOrUpdate(br, bw,
-                        Node.Read(br, root.Left, readEntry: false),
-                        entry);
-                }
-                root.Left = left;
+                    low = mid + 1;
             }
-            else
-            {
-                long right;
-                if (root.Right == -1)
-                {
-                    right = WriteNewNode(entry, bw);
-                }
-                else
-                {
-                    right = InsertOrUpdate(br, bw,
-                        Node.Read(br, root.Right, readEntry: false),
-                        entry);
-                }
-                root.Right = right;
-            }
-            root.UpdateHeight(br);
-            return Rebalance(br, bw, root);
+            return ~mid;
         }
-
-
-        private long Rebalance(BinaryReader br, BinaryWriter bw, Node root)
-        {
-            switch(root.BranchFactor)
-            {
-                case 2:
-                    var left = Node.Read(br, root.Left, readEntry: false);
-                    if(left.BranchFactor < 0)
-                    {
-                        root.Left = RotateLeft(br, bw, left);
-                    }
-                    return RotateRight(br, bw, root);
-                case -2:
-                    var right = Node.Read(br, root.Right, readEntry: false);
-                    if (right.BranchFactor > 0)
-                    {
-                        root.Right= RotateRight(br, bw, right);
-                    }
-                    return RotateLeft(br, bw, root);
-                default:
-                    // no change
-                    root.Write(bw);
-                    return root.Self;
-            }
-        }
-
-        private long RotateRight(BinaryReader br, BinaryWriter bw, Node root)
-        {
-            var pivot = Node.Read(br, root.Left, readEntry: false);
-            var tmp = pivot.Right;
-            pivot.Right = root.Self;
-            root.Left = tmp;
-
-            pivot.UpdateHeight(br);
-            root.UpdateHeight(br);
-
-            pivot.Write(bw);
-            root.Write(bw);
-
-            return pivot.Self;
-        }
-
-        private long RotateLeft(BinaryReader br, BinaryWriter bw, Node root)
-        {
-            var pivot = Node.Read(br, root.Right, readEntry: false);
-            var tmp = pivot.Left;
-            pivot.Left = root.Self;
-            root.Right = tmp;
-
-            pivot.UpdateHeight(br);
-            root.UpdateHeight(br);
-
-            pivot.Write(bw);
-            root.Write(bw);
-
-            return pivot.Self;
-        }
-
         public Entry GetByName(string name)
         {
-            using var file = File.Open(_filename, FileMode.OpenOrCreate);
-            if (file.Length == 0) return null;
+            using var file = File.Open(Path.Combine(_directory, "records"), FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read);
             using var br = new BinaryReader(file, Encoding.UTF8, leaveOpen: true);
-            file.Position = file.Length - sizeof(long);
-            var root = Node.Read(br, br.ReadInt64(), readEntry: false);
-            return root.Find(br, name);
+            foreach (var entriesPositions in GetSortedPositions())
+            {
+                var pos = Search(entriesPositions, br, name);
+                if (pos < 0)
+                    continue;
+                var filePos = entriesPositions[pos];
+                if (filePos < 0) return null; // deleted
+                br.BaseStream.Position = filePos;
+                return Entry.Read(br);
+            }
+            return null;
         }
+
 
         public IEnumerable<Entry> IterateOrderedByName(string afterName = null)
         {
-            using var file = File.Open(_filename, FileMode.OpenOrCreate);
-            if (file.Length == 0) yield break;
+            var positions = GetSortedPositions();
+
+            using var file = File.Open(Path.Combine(_directory, "records"), FileMode.OpenOrCreate);
             using var br = new BinaryReader(file, Encoding.UTF8, leaveOpen: true);
-            file.Position = file.Length - sizeof(long);
-            var root = Node.Read(br, br.ReadInt64(), readEntry: true);
-            foreach(var item in root.IterateAfter(br, afterName ?? string.Empty))
+
+            for (int i = 0; i < positions.Count; i++)
             {
-                yield return item;
+                var pos = Search(positions[i], br, afterName ?? string.Empty);
+                if (pos < 0)
+                    pos = ~pos;
+                positions[i] = new SlicedRandomAccess(positions[i], pos);
+            }
+            foreach (var pos in MergeSorted(positions, br))
+            {
+                br.BaseStream.Position = pos;
+                yield return Entry.Read(br);
             }
         }
     }

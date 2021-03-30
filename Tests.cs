@@ -7,24 +7,29 @@ namespace pb
 {
     public class PhonebookTests : IDisposable
     {
-        private string _fileName = Guid.NewGuid().ToString();
+        private string _directory = Guid.NewGuid().ToString();
+
+        public PhonebookTests()
+        {
+            Directory.CreateDirectory(_directory);
+        }
 
         public void Dispose()
         {
-            File.Delete(_fileName);
+            Directory.Delete(_directory, true);
         }
 
         [Fact]
         public void EmptyPhoneBookHasNoEntries()
         {
-            var pb = new Phonebook(_fileName);
+            var pb = new Phonebook(_directory);
             Assert.Empty(pb.IterateOrderedByName());
         }
 
         [Fact]
         public void CanInsertAndGetResults()
         {
-            var pb = new Phonebook(_fileName);
+            var pb = new Phonebook(_directory);
             var inserted = new Phonebook.Entry{
                 Name = "Oren",
                 Number = "1234",
@@ -43,7 +48,7 @@ namespace pb
         [Fact]
         public void CanUpdateData()
         {
-            var pb = new Phonebook(_fileName);
+            var pb = new Phonebook(_directory);
             var inserted = new Phonebook.Entry{
                 Name = "Oren",
                 Number = "1234",
@@ -65,7 +70,7 @@ namespace pb
         [Fact]
         public void CanInsertMultipleResults()
         {
-            var pb = new Phonebook(_fileName);
+            var pb = new Phonebook(_directory);
             var inputs = new[]
             {
                 new Phonebook.Entry{Name = "Oren",Number = "1234",Type = "test"},
@@ -89,5 +94,28 @@ namespace pb
                 Assert.Equal(item, pb.GetByName(item.Name));
             }
         }
+
+        [Fact]
+        public void CanInsertEnoughForCompaction()
+        {
+            var pb = new Phonebook(_directory);
+            for (int i = 0; i < 100_000; i++)
+            {
+                var inserted = new Phonebook.Entry
+                {
+                    Name = i.ToString("D8"),
+                    Number = "1234",
+                    Type = "test"
+                };
+
+                pb.InsertOrUpdate(inserted);
+            }
+
+            for (int i = 0; i < 100_000; i++)
+            {
+                Assert.NotNull(pb.GetByName(i.ToString("D8")));
+            }
+        }
+
     }
 }
