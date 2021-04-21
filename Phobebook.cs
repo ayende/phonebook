@@ -321,7 +321,7 @@ namespace pb
             int mid = 0;
             while (low <= high)
             {
-                mid = (low + high) >> 1;
+                mid = low + (high - low) / 2;
                 var pos = access[mid];
                 if (pos < 0)
                     pos = ~pos;
