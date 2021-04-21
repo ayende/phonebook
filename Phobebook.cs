@@ -335,7 +335,7 @@ namespace pb
                 else
                     low = mid + 1;
             }
-            return ~mid;
+            return ~low;
         }
         public Entry GetByName(string name)
         {
